@@ -3,10 +3,13 @@ pragma solidity ^0.8.9;
 
 import "@openzeppelin/contracts/utils/Address.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 // Import chainlink contracts
 import "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
 import "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
+// Uniswap router needed for eth -> link exchanges
+import "./IUniswapRouter.sol";
 
 // Import this file to use console.log
 import "hardhat/console.sol";
@@ -20,6 +23,7 @@ contract CryptoLotto is VRFConsumerBaseV2, Ownable {
     using Address for address payable;
 
     // ChainLink VRF vars:
+    ERC20 linkToken;
 
     VRFCoordinatorV2Interface COORDINATOR;
     // Your subscription ID.
@@ -27,13 +31,12 @@ contract CryptoLotto is VRFConsumerBaseV2, Ownable {
 
     // Rinkeby coordinator. For other networks,
     // see https://docs.chain.link/docs/vrf-contracts/#configurations
-    address vrfCoordinator = 0x6168499c0cFfCaCD319c818142124B7A15E857ab;
+    address vrfCoordinator;
 
     // The gas lane to use, which specifies the maximum gas price to bump to.
     // For a list of available gas lanes on each network,
     // see https://docs.chain.link/docs/vrf-contracts/#configurations
-    bytes32 s_keyHash =
-        0xd89b2bf150e3b9e13446986e571fb9cab24b13cea0a43ea20a6049a85cc807cc;
+    bytes32 s_keyHash;
 
     // Depends on the number of requested values that you want sent to the
     // fulfillRandomWords() function. Storing each word costs about 20,000 gas,
@@ -76,6 +79,8 @@ contract CryptoLotto is VRFConsumerBaseV2, Ownable {
     mapping(uint256 => Lotto) public lottos;
     mapping(uint256 => uint256) private _vrfRequests;
 
+    IUniswapRouter ur; // uniswap router contract
+
     //  the precent taken by the contract creators;
     uint256 public ownerFee = 2.0;
     // where the contract fee is to be sent upon
@@ -83,7 +88,10 @@ contract CryptoLotto is VRFConsumerBaseV2, Ownable {
     // can be changed later by owner;
     address payable private feeAddress;
     // minimum deposit
-    uint256 public minDeposit = 10**15; // in wei, 1 thousanth of an eth
+    uint256 public minDeposit = 10**15; // in wei, 0.001 ETH
+
+    address wEthAddress;
+    uint256 linkPremium;
 
     // LottoCreated
     event LottoCreated(uint256 _lottoID);
@@ -103,8 +111,50 @@ contract CryptoLotto is VRFConsumerBaseV2, Ownable {
     // Random draw event
     event RandomDraw(uint256 _lottoID, uint256 _randNum);
 
-    constructor() VRFConsumerBaseV2(vrfCoordinator) {
+    constructor(
+        address _linkTokenAddress,
+        address _vrfCoordinator,
+        bytes32 _s_keyHash,
+        address _uniswapRouterAddress,
+        address _wEth,
+        uint256 _linkPremium
+    ) VRFConsumerBaseV2(vrfCoordinator) {
+        // init wEth address
+        wEthAddress = _wEth;
+        // init linkPremium (how much link needed per VRF call)
+        linkPremium = _linkPremium;
+        // init fee address
         feeAddress = payable(owner());
+        // initialize chainlink token
+        s_keyHash = _s_keyHash;
+        linkToken = ERC20(_linkTokenAddress);
+        // initialize the COORDINATOR
+        COORDINATOR = VRFCoordinatorV2Interface(_vrfCoordinator);
+        // Create a subscription with a new subscription ID, the owner of this subscription will
+        // be this contract
+        address[] memory consumers = new address[](1);
+        consumers[0] = address(this);
+        s_subscriptionId = COORDINATOR.createSubscription();
+        // Add this contract as a consumer of its own subscription.
+        COORDINATOR.addConsumer(s_subscriptionId, consumers[0]);
+        // setup uniswap router
+        ur = IUniswapRouter(_uniswapRouterAddress);
+    }
+
+    function setLinkPremium(uint256 _linkPremium) external onlyOwner {
+        linkPremium = _linkPremium;
+    }
+
+    // return link balance, useful for monitoring;
+    function linkBalance() external view returns (uint256 bal) {
+        return linkToken.balanceOf(address(this));
+    }
+
+    // incase link token accumulates (should not) owner can withdraw
+    // and correct the situation manually
+    // TODO: remove after better testing
+    function withdrawLink() external onlyOwner {
+        linkToken.transfer(owner(), linkToken.balanceOf(address(this)));
     }
 
     modifier lottoExists(uint256 lottoID) {
@@ -215,10 +265,30 @@ contract CryptoLotto is VRFConsumerBaseV2, Ownable {
         );
         // Close lotto
         lottos[lottoID].lottoClosed = true;
+        // buy link and add to chainlink subscription
+        buyNeededLink(lottoID);
         // else get the random number and find the winner.
         getRandomNumber(lottoID);
         // Emit closed lotto event;
         emit LottoClosed(lottoID);
+    }
+
+    function buyNeededLink(uint256 lottoID) private {
+        address[] memory path = new address[](2);
+        path[0] = wEthAddress;
+        path[1] = address(linkToken);
+        uint256[] memory amountOut = ur.getAmountsIn(linkPremium, path);
+        require(
+            lottos[lottoID].balance >= amountOut[0],
+            "Lotto pool has insufficient balance to get link"
+        );
+        lottos[lottoID].balance -= amountOut[0];
+        ur.swapExactETHForTokens{value: amountOut[0]}(
+            linkPremium,
+            path,
+            address(this),
+            block.timestamp + 10 * 60
+        );
     }
 
     // allows anyone to call this function and send winnings to the winner
@@ -243,7 +313,7 @@ contract CryptoLotto is VRFConsumerBaseV2, Ownable {
         feeAddress = newAddress;
     }
 
-    // Allows the contract owner to set the min deposit
+    // Allows the contract owner to set the min deposit in wei
     function setMinDeposit(uint256 newMinDeposit) external onlyOwner {
         minDeposit = newMinDeposit;
     }
@@ -270,8 +340,12 @@ contract CryptoLotto is VRFConsumerBaseV2, Ownable {
             lottos[lottoID].amounts[msg.sender] +
             msg.value;
         lottos[lottoID].totalAmount += msg.value;
+        // calcuate fee
+        uint256 fee = (ownerFee * msg.value) / 100;
+        // increment lotto pool balance by deposit minus fee
+        lottos[lottoID].balance += msg.value - fee;
         // send fee to owner
-        payable(feeAddress).sendValue((ownerFee * msg.value) / 100);
+        payable(feeAddress).sendValue(fee);
         require(
             lottos[lottoID].participants.length > 0,
             "Error, participants.length cannot equal zero after deposit"
