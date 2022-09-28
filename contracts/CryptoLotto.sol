@@ -273,6 +273,7 @@ contract CryptoLotto is VRFConsumerBaseV2, Ownable {
         emit LottoClosed(lottoID);
     }
 
+    // buys enough link for one VRF call
     function buyNeededLink(uint256 lottoID) private {
         address[] memory path = new address[](2);
         path[0] = wEthAddress;
