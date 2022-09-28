@@ -11,8 +11,10 @@ import "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
 // Import this file to use console.log
 import "hardhat/console.sol";
 
-contract CyrptoLotto is VRFConsumerBaseV2, Ownable {
+// needed for random sampling calc
+uint256 constant MAX_INT = 2**256 - 1;
 
+contract CryptoLotto is VRFConsumerBaseV2, Ownable {
     // Use OpenZeppelin implementation of payable address
     // for sending eth more safely.
     using Address for address payable;
@@ -46,75 +48,117 @@ contract CyrptoLotto is VRFConsumerBaseV2, Ownable {
     // num random words to return from chain link VRF
     uint32 numWords = 1;
 
-    // Cyrpto Lotto vars
+    struct Lotto {
+        uint256 id;
+        // array of participant addresses
+        address[] participants;
+        // mapping of participants to their amounts
+        mapping(address => uint256) amounts;
+        // lotto end time
+        uint256 unlockTime;
+        uint256 totalAmount;
+        uint256 balance;
+        // we will store the random result here
+        uint256 randomResult;
+        // the winner's address
+        address winner;
+        // is the lotto closed or is it open and accepting bets
+        bool lottoClosed;
+        // runningSum and runningIndex are
+        // needed to compute winner safely in a partial manner,
+        // without hitting a block
+        // gas limit in the case of an extreme amount of participants;
+        uint256 runningSum;
+        uint256 runningIndex;
+    }
 
-    // needed for random sampling calc
-    uint256 constant private MAX_INT = 2**256 - 1;
+    // Cyrpto Lotto vars
+    mapping(uint256 => Lotto) public lottos;
+    mapping(uint256 => uint256) private _vrfRequests;
+
     //  the precent taken by the contract creators;
     uint256 public ownerFee = 2.0;
-    // where the contract fee is to be sent upon 
+    // where the contract fee is to be sent upon
     // bet placement, by default will be the owner address
     // can be changed later by owner;
     address payable private feeAddress;
-    // lotto end time
-    uint256 public unlockTime;
-    // array of participant addresses
-    address[] public participants;
-    // mapping of participants to their amounts
-    mapping(address => uint256) public amounts;
-    uint256 public totalAmount;
-    // we will store the random result here
-    uint256 public randomResult;
-    // the winner's address
-    address private winner;
     // minimum deposit
     uint256 public minDeposit = 10**15; // in wei, 1 thousanth of an eth
-    // is the lotto closed or is it open and accepting bets
-    bool public lottoClosed = false;
-    // runningSum and runningIndex are 
-    // needed to compute winner safely in a partial manner,
-    // without hitting a block
-    // gas limit in the case of an extreme amount of participants;
-    uint256 private runningSum = 0;
-    uint256 public runningIndex = 0;
 
+    // LottoCreated
+    event LottoCreated(uint256 _lottoID);
     // Lotto is not closed and no longer accepting bets
-    event LottoClosed();
+    event LottoClosed(uint256 _lottoID);
     // Winner has been determined
-    event WinnerSelected(address _winner, uint256 amount);
+    event WinnerSelected(uint256 _lottoID, address _winner, uint256 amount);
     // Winner has withdrawn their funds
-    event Withdrawal(address _address, uint256 amount, uint256 when);
+    event Withdrawal(
+        uint256 _lottoID,
+        address _address,
+        uint256 amount,
+        uint256 when
+    );
     // Someone has made a bet
-    event Deposit(address _address, uint256 _amount);
+    event Deposit(uint256 lottoID, address _address, uint256 _amount);
     // Random draw event
-    event RandomDraw(uint256 _randNum);
+    event RandomDraw(uint256 _lottoID, uint256 _randNum);
 
-    constructor(uint256 _unlockTime)
-        VRFConsumerBaseV2(vrfCoordinator)
-    {
-        require(
-            block.timestamp < _unlockTime,
-            "Unlock time should be in the future"
-        );
-
-        unlockTime = _unlockTime;
+    constructor() VRFConsumerBaseV2(vrfCoordinator) {
         feeAddress = payable(owner());
     }
 
-    function getWinner() external view returns(address) {
-        return winner;
+    modifier lottoExists(uint256 lottoID) {
+        require(lottos[lottoID].id != 0, "Lotto does not exist");
+        _;
+    }
+
+    uint256 public numLottos;
+
+    function createLotto(uint256 unlockTime) external onlyOwner {
+        Lotto storage lotto = lottos[numLottos + 1];
+        lotto.unlockTime = unlockTime;
+        numLottos += 1;
+        emit LottoCreated(numLottos);
+    }
+
+    uint256 waitPeriod = 24 * 60 * 60 * 60; // 60 days;
+
+    function deleteLotto(uint256 lottoID)
+        external
+        onlyOwner
+        lottoExists(lottoID)
+    {
+        require(lottos[lottoID].lottoClosed, "Lotto is not closed");
+        require(
+            lottos[lottoID].unlockTime < block.timestamp + waitPeriod,
+            "Wait period has not passed."
+        );
+        if (lottos[lottoID].balance > 0) {
+            // send unclaimed balance to owner
+            // TODO: implement recyling to reward users
+            payable(feeAddress).sendValue(lottos[lottoID].balance);
+        }
+        delete lottos[lottoID];
+    }
+
+    function getWinner(uint256 lottoID) external view returns (address) {
+        return lottos[lottoID].winner;
     }
 
     // Initializes the ChainLink VRF call
-    function getRandomNumber() private returns (uint256 requestId) {
-        return
-            COORDINATOR.requestRandomWords(
-                s_keyHash,
-                s_subscriptionId,
-                requestConfirmations,
-                callbackGasLimit,
-                numWords
-            );
+    function getRandomNumber(uint256 lottoID)
+        private
+        returns (uint256 requestId)
+    {
+        uint256 rID = COORDINATOR.requestRandomWords(
+            s_keyHash,
+            s_subscriptionId,
+            requestConfirmations,
+            callbackGasLimit,
+            numWords
+        );
+        _vrfRequests[requestId] = lottoID;
+        return rID;
     }
 
     // fulfillRandomWords function called by ChainLink once the random 'word'
@@ -123,51 +167,75 @@ contract CyrptoLotto is VRFConsumerBaseV2, Ownable {
         internal
         override
     {
-        randomResult = randomWords[0] % MAX_INT;
-        emit RandomDraw(randomResult);
+        uint256 lottoID = _vrfRequests[requestId];
+        lottos[lottoID].randomResult = randomWords[0] % MAX_INT;
+        emit RandomDraw(lottoID, lottos[lottoID].randomResult);
     }
 
-    // Allow anyone to call this function just in case owner 
+    // Allow anyone to call this function just in case owner
     // disappears
-    function computeWinnerPartial(uint256 N) external {
-        require(lottoClosed, "Lotto not yet closed.");
-        require(winner == address(0), "Winner already selected");
-        require(N > runningIndex, "N too small");
+    function computeWinnerPartial(uint256 lottoID, uint256 N) external {
+        require(lottos[lottoID].lottoClosed, "Lotto not yet closed.");
+        require(
+            lottos[lottoID].winner == address(0),
+            "Winner already selected"
+        );
+        require(N > lottos[lottoID].runningIndex, "N too small");
 
-        uint256 upper = N < participants.length ? N : participants.length;
+        uint256 upper = N < lottos[lottoID].participants.length
+            ? N
+            : lottos[lottoID].participants.length;
 
-        for (uint256 i = runningIndex; i < upper; i++) {
-            address participant = participants[i];
-            runningSum += amounts[participant];
-            if (randomResult <= (runningSum / totalAmount) * MAX_INT) {
-                winner = participant;
-                emit WinnerSelected(winner, address(this).balance);
+        for (uint256 i = lottos[lottoID].runningIndex; i < upper; i++) {
+            address participant = lottos[lottoID].participants[i];
+            lottos[lottoID].runningSum += lottos[lottoID].amounts[participant];
+            if (
+                lottos[lottoID].randomResult <=
+                (lottos[lottoID].runningSum / lottos[lottoID].totalAmount) *
+                    MAX_INT
+            ) {
+                lottos[lottoID].winner = participant;
+                emit WinnerSelected(
+                    lottoID,
+                    lottos[lottoID].winner,
+                    lottos[lottoID].balance
+                );
                 break;
             }
         }
-        runningIndex = participants.length - 1;
+        lottos[lottoID].runningIndex = lottos[lottoID].participants.length - 1;
     }
 
-    // can be called by anyone to closed the lotto once the 
+    // can be called by anyone to closed the lotto once the
     // unlockTime has passed
-    function closeLotto() external {
-        require(block.timestamp > unlockTime, "Still too early");
+    function closeLotto(uint256 lottoID) external lottoExists(lottoID) {
+        require(
+            block.timestamp > lottos[lottoID].unlockTime,
+            "Still too early"
+        );
         // Close lotto
-        lottoClosed = true;
+        lottos[lottoID].lottoClosed = true;
         // else get the random number and find the winner.
-        getRandomNumber();
+        getRandomNumber(lottoID);
         // Emit closed lotto event;
-        emit LottoClosed();
+        emit LottoClosed(lottoID);
     }
 
     // allows anyone to call this function and send winnings to the winner
     // Of course this will cost the caller gas, so presumably only the winner
     // or a realted entity will be incentivized to make the call;
-    function withdrawWinnings() external {
-        require(winner != address(0), "Winner is not yet determined.");
-        uint256 balance = address(this).balance;
-        payable(winner).sendValue(balance);
-        emit Withdrawal(winner, balance, block.timestamp);
+    function withdrawWinnings(uint256 lottoID) external lottoExists(lottoID) {
+        require(
+            lottos[lottoID].winner != address(0),
+            "Winner is not yet determined."
+        );
+        payable(lottos[lottoID].winner).sendValue(lottos[lottoID].balance);
+        emit Withdrawal(
+            lottoID,
+            lottos[lottoID].winner,
+            lottos[lottoID].balance,
+            block.timestamp
+        );
     }
 
     // Allows the contract owner to change the feeAddress
@@ -180,28 +248,35 @@ contract CyrptoLotto is VRFConsumerBaseV2, Ownable {
         minDeposit = newMinDeposit;
     }
 
-    // Allows the anyone to view the fee address
+    // Allows anyone to view the fee address
     function getFeeAddress() external view returns (address) {
         return feeAddress;
     }
 
     // Here the contract receives bets, the lotto must be still open
     // and the amount sent must exceed the minDeposit amount;
-    receive() external payable {
+    function deposit(uint256 lottoID) external payable lottoExists(lottoID) {
         require(msg.value > minDeposit, "Sent amount is less than minDeposit");
-        require(!lottoClosed, "Lotto is closed, cannot receive funds");
-        if (amounts[msg.sender] == 0) {
-            participants[participants.length] = msg.sender;
+        require(
+            !lottos[lottoID].lottoClosed,
+            "Lotto is closed, cannot receive funds"
+        );
+        if (lottos[lottoID].amounts[msg.sender] == 0) {
+            lottos[lottoID].participants[
+                lottos[lottoID].participants.length
+            ] = msg.sender;
         }
-        amounts[msg.sender] = amounts[msg.sender] + msg.value;
-        totalAmount += msg.value;
+        lottos[lottoID].amounts[msg.sender] =
+            lottos[lottoID].amounts[msg.sender] +
+            msg.value;
+        lottos[lottoID].totalAmount += msg.value;
         // send fee to owner
         payable(feeAddress).sendValue((ownerFee * msg.value) / 100);
         require(
-            participants.length > 0,
-            "bug in code, participants.length cannot equal zero after deposit"
+            lottos[lottoID].participants.length > 0,
+            "Error, participants.length cannot equal zero after deposit"
         );
         // Emit deposit event;
-        emit Deposit(msg.sender, msg.value);
+        emit Deposit(lottoID, msg.sender, msg.value);
     }
 }
